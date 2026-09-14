@@ -1,0 +1,11 @@
+# Your WhatsApp session keys, message store and downloaded media. Never commit.
+auth/
+media/
+store.db
+store.db-shm
+store.db-wal
+bridge.log
+
+node_modules/
+.DS_Store
+Thumbs.db
