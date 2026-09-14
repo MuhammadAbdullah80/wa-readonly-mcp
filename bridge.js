@@ -2,7 +2,7 @@
  * WhatsApp bridge — read-only.
  *
  * Holds the WhatsApp linked-device connection, mirrors messages into store.db,
- * and downloads image/document media to media/. Never sends anything.
+ * and downloads images, documents and voice notes to media/. Never sends anything.
  *
  *   node bridge.js                      first run prints a QR code to link
  *   node bridge.js --pair +15551234567  link with a pairing code instead
@@ -12,6 +12,8 @@
  *                ignored (default: all chats). Find JIDs with wa_list_chats.
  *   WA_DATA_DIR  where store.db, media/ and auth/ live (default: this folder)
  *   WA_MAX_MEDIA_MB  skip attachments larger than this (default: 25)
+ *
+ * Any of these can also go in a .env file next to this script.
  */
 import {
   makeWASocket,          // named export — the default export is the module object in Baileys 6.17+
@@ -29,7 +31,9 @@ import { join } from 'node:path';
 import { openDb, setMeta, AUTH_DIR, MEDIA_DIR, ROOT } from './db.js';
 
 const MAX_MEDIA_BYTES = Number(process.env.WA_MAX_MEDIA_MB || 25) * 1024 * 1024;
-const MEDIA_KINDS = new Set(['image', 'document', 'sticker']); // video/audio: metadata only
+const MEDIA_KINDS = new Set(['image', 'document', 'sticker', 'voice', 'audio']); // video: metadata only
+const AUDIO_KINDS = new Set(['voice', 'audio']);
+const EXT = { image: 'jpg', sticker: 'webp', voice: 'ogg', audio: 'm4a' };
 const ALLOWED_CHATS = new Set((process.env.WA_CHATS || '').split(',').map((s) => s.trim()).filter(Boolean));
 
 const logger = pino({ level: 'silent' });
@@ -58,11 +62,12 @@ const upsertChat = db.prepare(`
 
 const upsertMsg = db.prepare(`
   INSERT INTO messages (id, chat_jid, sender_jid, sender_name, ts, from_me, kind, body,
-                        quoted_id, media_path, media_mime, media_bytes, filename)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        quoted_id, media_path, media_mime, media_bytes, filename, media_ref)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   ON CONFLICT(chat_jid, id) DO UPDATE SET
     body       = COALESCE(NULLIF(excluded.body, ''), messages.body),
-    media_path = COALESCE(excluded.media_path, messages.media_path)`);
+    media_path = COALESCE(excluded.media_path, messages.media_path),
+    media_ref  = COALESCE(excluded.media_ref, messages.media_ref)`);
 
 const upsertReaction = db.prepare(`
   INSERT INTO reactions (chat_jid, target_id, sender_jid, emoji, ts) VALUES (?,?,?,?,?)
@@ -109,7 +114,7 @@ function describe(message) {
     mime: m.documentMessage.mimetype,
   };
   if (m.audioMessage) return {
-    kind: m.audioMessage.ptt ? 'voice' : 'audio', body: '', mime: m.audioMessage.mimetype,
+    kind: m.audioMessage.ptt ? 'voice' : 'audio', body: '', mime: m.audioMessage.mimetype, audio: m.audioMessage,
   };
   if (m.stickerMessage) return { kind: 'sticker', body: '', mime: m.stickerMessage.mimetype };
   if (m.locationMessage) {
@@ -130,7 +135,8 @@ function quotedId(message) {
   const ctx = m?.extendedTextMessage?.contextInfo
     || m?.imageMessage?.contextInfo
     || m?.videoMessage?.contextInfo
-    || m?.documentMessage?.contextInfo;
+    || m?.documentMessage?.contextInfo
+    || m?.audioMessage?.contextInfo;
   return ctx?.stanzaId || null;
 }
 
@@ -143,13 +149,29 @@ async function saveMedia(msg, kind, filename) {
   try {
     const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger });
     if (!buf || buf.length > MAX_MEDIA_BYTES) return null;
-    const base = filename ? safeName(filename) : `${msg.key.id}.${kind === 'image' ? 'jpg' : 'bin'}`;
+    const base = filename ? safeName(filename) : `${msg.key.id}.${EXT[kind] || 'bin'}`;
     const out = join(MEDIA_DIR, `${msg.key.id}_${base}`);
     writeFileSync(out, buf);
     return { path: out, bytes: buf.length };
   } catch {
     return null;   // expired off the CDN, or an unsupported type — metadata is still stored
   }
+}
+
+/**
+ * Voice notes from history sync aren't downloaded up front. Keep the CDN
+ * reference so wa_transcribe can fetch one later, while WhatsApp still has it
+ * (typically a few weeks). The key decrypts only that one file.
+ */
+function mediaRef(audio) {
+  if (!audio?.mediaKey || !(audio.directPath || audio.url)) return null;
+  return JSON.stringify({
+    mediaKey: Buffer.from(audio.mediaKey).toString('base64'),
+    directPath: audio.directPath || null,
+    url: audio.url || null,
+    mimetype: audio.mimetype || null,
+    seconds: Number(audio.seconds) || null,
+  });
 }
 
 async function record(msg, { downloadMedia = true } = {}) {
@@ -169,7 +191,7 @@ async function record(msg, { downloadMedia = true } = {}) {
     return;
   }
 
-  const { kind, body, filename, mime } = describe(msg.message);
+  const { kind, body, filename, mime, audio } = describe(msg.message);
   if (kind === 'protocol') return;
 
   const isGroup = chatJid.endsWith('@g.us');
@@ -185,6 +207,7 @@ async function record(msg, { downloadMedia = true } = {}) {
     msg.key.id, chatJid, senderJid, msg.pushName || null, ts, msg.key.fromMe ? 1 : 0,
     kind, body || '', quotedId(msg.message),
     media?.path || null, mime || null, media?.bytes || null, filename || null,
+    AUDIO_KINDS.has(kind) ? mediaRef(audio) : null,
   );
   upsertChat.run(chatJid, isGroup ? '' : (msg.pushName || ''), isGroup ? 1 : 0, ts);
 }

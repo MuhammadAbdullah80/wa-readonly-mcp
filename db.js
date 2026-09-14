@@ -3,6 +3,12 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Optional settings file next to the code (GEMINI_API_KEY, WA_CHATS, ...).
+// Variables already set in the environment win over the file.
+try {
+  process.loadEnvFile(join(dirname(fileURLToPath(import.meta.url)), '.env'));
+} catch { /* no .env — that's fine */ }
+
 // Everything lives next to the code unless WA_DATA_DIR points elsewhere.
 export const ROOT = process.env.WA_DATA_DIR
   ? resolve(process.env.WA_DATA_DIR)
@@ -40,6 +46,8 @@ export function openDb({ readonly = false } = {}) {
         media_mime   TEXT,
         media_bytes  INTEGER,
         filename     TEXT,
+        media_ref    TEXT,           -- voice/audio: what's needed to fetch it later
+        transcript   TEXT,           -- voice/audio: filled in by wa_transcribe
         PRIMARY KEY (chat_jid, id)
       );
       CREATE INDEX IF NOT EXISTS idx_msg_chat_ts ON messages (chat_jid, ts DESC);
@@ -66,6 +74,12 @@ export function openDb({ readonly = false } = {}) {
         value TEXT
       );
     `);
+
+    // Stores created by earlier versions lack the voice-note columns.
+    const cols = new Set(db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name));
+    for (const col of ['media_ref', 'transcript']) {
+      if (!cols.has(col)) db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`);
+    }
   }
   return db;
 }

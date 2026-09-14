@@ -9,3 +9,6 @@ bridge.log
 node_modules/
 .DS_Store
 Thumbs.db
+
+# Your API keys
+.env

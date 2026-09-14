@@ -2,7 +2,8 @@
  * WhatsApp MCP server — read-only.
  *
  * Serves the local store.db that bridge.js maintains. Exposes no way to send,
- * edit, delete or react to anything.
+ * edit, delete or react to anything. The one outbound call is wa_transcribe,
+ * which sends a single voice note to Gemini when asked to.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -11,6 +12,7 @@ import { existsSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { openDb, getMeta, setMeta, DB_PATH, ROOT } from './db.js';
+import { audioBytes, transcribe, transcriptionConfigured } from './transcribe.js';
 
 const db = openDb();
 
@@ -88,13 +90,28 @@ function requireChat(query) {
   return hits[0];
 }
 
+const AUDIO_KINDS = new Set(['voice', 'audio']);
+
+function duration(m) {
+  try {
+    const secs = JSON.parse(m.media_ref || '{}').seconds;
+    return secs ? ` ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}` : '';
+  } catch { return ''; }
+}
+
 function renderMessages(rows, { showChat = false } = {}) {
   if (!rows.length) return '(no messages)';
   return rows.map((m) => {
     const who = m.from_me ? 'me' : (m.sender_name || displayName(m.sender_jid));
-    const tag = m.kind === 'text' ? '' : ` [${m.kind}${m.filename ? `: ${m.filename}` : ''}${m.media_path ? '' : ', not downloaded'}]`;
     const where = showChat ? ` {${chatLabel({ jid: m.chat_jid, name: m.chat_name, is_group: m.chat_is_group })}}` : '';
-    const body = (m.body || '').replace(/\s+/g, ' ').trim();
+    let tag = m.kind === 'text' ? '' : ` [${m.kind}${m.filename ? `: ${m.filename}` : ''}${m.media_path ? '' : ', not downloaded'}]`;
+    let body = (m.body || '').replace(/\s+/g, ' ').trim();
+    if (AUDIO_KINDS.has(m.kind)) {
+      tag = ` [${m.kind}${duration(m)}]`;
+      body = m.transcript
+        ? `"${m.transcript.replace(/\s+/g, ' ').trim()}"`
+        : (m.media_path || m.media_ref ? '(not transcribed yet: wa_transcribe)' : '(audio not available)');
+    }
     return `[${iso(m.ts)}]${where} ${who}${tag}: ${body}   (id:${m.id})`;
   }).join('\n');
 }
@@ -185,6 +202,22 @@ const TOOLS = [
     },
   },
   {
+    name: 'wa_transcribe',
+    description: 'Transcribe WhatsApp voice notes with Gemini (non-English is also translated to English). '
+      + 'Give a message_id for one voice note, or a chat to transcribe its most recent untranscribed ones. '
+      + 'Transcripts are saved, so each note is only sent once.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'A voice or audio message id.' },
+        chat: { type: 'string', description: 'Or: chat name (fuzzy) or jid, to transcribe its latest voice notes.' },
+        limit: { type: 'number', description: 'With chat: how many voice notes. Default 5, max 20.' },
+        since: { type: 'string', description: 'With chat: only voice notes on/after this date, YYYY-MM-DD.' },
+        force: { type: 'boolean', description: 'Transcribe again even if a transcript is saved.' },
+      },
+    },
+  },
+  {
     name: 'wa_reactions',
     description: 'List emoji reactions in a chat, with the message each one is attached to.',
     inputSchema: {
@@ -208,6 +241,7 @@ const handlers = {
     const chats = db.prepare('SELECT COUNT(*) c FROM chats').get().c;
     const media = db.prepare('SELECT COUNT(*) c FROM messages WHERE media_path IS NOT NULL').get().c;
     const reacts = db.prepare('SELECT COUNT(*) c FROM reactions').get().c;
+    const voice = db.prepare("SELECT COUNT(*) c, COUNT(transcript) t FROM messages WHERE kind IN ('voice','audio')").get();
     const hb = Number(getMeta(db, 'heartbeat') || 0);
     const age = hb ? Math.round((Date.now() - hb) / 1000) : null;
     const live = bridgeAlive();
@@ -216,6 +250,8 @@ const handlers = {
       hb ? `Heartbeat: ${age}s ago` : 'Heartbeat: never',
       `Linked as: ${getMeta(db, 'self_jid') || '(not linked)'}`,
       `Stored:    ${n} messages across ${chats} chats, ${media} downloaded attachments, ${reacts} reactions`,
+      `Voice:     ${voice.c} voice/audio messages, ${voice.t} transcribed; `
+        + `transcription ${transcriptionConfigured() ? 'on (Gemini)' : 'off (no GEMINI_API_KEY)'}`,
       `Database:  ${DB_PATH} (${(statSync(DB_PATH).size / 1e6).toFixed(1)} MB)`,
     ].join('\n'));
   },
@@ -253,9 +289,9 @@ const handlers = {
     const rows = db.prepare(`
       SELECT m.*, c.name AS chat_name, c.is_group AS chat_is_group
       FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid
-      WHERE m.body LIKE ? AND (? IS NULL OR m.chat_jid = ?)
+      WHERE (m.body LIKE ? OR m.transcript LIKE ?) AND (? IS NULL OR m.chat_jid = ?)
       ORDER BY m.ts DESC LIMIT ?`)
-      .all(`%${query}%`, jid, jid, Math.min(limit, 200));
+      .all(`%${query}%`, `%${query}%`, jid, jid, Math.min(limit, 200));
     return text(rows.length ? renderMessages(rows, { showChat: !jid }) : `(nothing matching "${query}")`);
   },
 
@@ -274,7 +310,9 @@ const handlers = {
     if (!m) return text(`No message with id ${message_id}`);
     if (!m.media_path) {
       return text(`Message ${message_id} is a "${m.kind}" with no downloaded file. `
-        + 'Video and audio are stored as metadata only; other files may have expired off WhatsApp servers.');
+        + (AUDIO_KINDS.has(m.kind) && m.media_ref
+          ? 'wa_transcribe will fetch and transcribe it.'
+          : 'Video is stored as metadata only; other files may have expired off WhatsApp servers.'));
     }
     if (!existsSync(m.media_path)) return text(`Recorded at ${m.media_path} but the file is gone.`);
     return text(`${m.media_path}\n${m.media_mime || ''} ${m.media_bytes ? `${(m.media_bytes / 1024).toFixed(0)} KB` : ''}`);
@@ -289,6 +327,52 @@ const handlers = {
     return text(rows.map((m) =>
       `[${iso(m.ts)}] ${m.kind.padEnd(9)} ${m.filename || '(unnamed)'}\n    ${m.media_path}   (id:${m.id})`
     ).join('\n'));
+  },
+
+  async wa_transcribe({ message_id, chat, limit = 5, since, force = false }) {
+    let rows;
+    if (message_id) {
+      const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(message_id);
+      if (!m) return text(`No message with id ${message_id}`);
+      if (!AUDIO_KINDS.has(m.kind)) return text(`Message ${message_id} is a "${m.kind}", not a voice note.`);
+      rows = [m];
+    } else if (chat) {
+      const c = requireChat(chat);
+      rows = db.prepare(`
+        SELECT * FROM messages
+        WHERE chat_jid = ? AND kind IN ('voice','audio') AND (? = 1 OR transcript IS NULL)
+          AND (media_path IS NOT NULL OR media_ref IS NOT NULL) AND (? IS NULL OR ts >= ?)
+        ORDER BY ts DESC LIMIT ?`)
+        .all(c.jid, force ? 1 : 0, since ?? null, since ? day(since) : 0, Math.max(1, Math.min(limit, 20)))
+        .reverse();
+      if (!rows.length) return text(`No untranscribed voice notes in ${chatLabel(c)}.`);
+    } else {
+      return text('Give a message_id, or a chat.');
+    }
+
+    const saveTranscript = db.prepare('UPDATE messages SET transcript = ? WHERE chat_jid = ? AND id = ?');
+    const savePath = db.prepare('UPDATE messages SET media_path = ?, media_bytes = ? WHERE chat_jid = ? AND id = ?');
+    const out = [];
+    for (const m of rows) {
+      const who = m.from_me ? 'me' : (m.sender_name || displayName(m.sender_jid));
+      const head = `[${iso(m.ts)}] ${who} [${m.kind}${duration(m)}] (id:${m.id})`;
+      if (m.transcript && !force) { out.push(`${head}\n${m.transcript}`); continue; }
+      if (!transcriptionConfigured()) {
+        return { ...text('Transcription is off: add GEMINI_API_KEY=... (free at https://aistudio.google.com/apikey) '
+          + `to the .env file next to server.js, then restart Claude Code.`), isError: true };
+      }
+      try {
+        const { buf, path, fetched } = await audioBytes(m);
+        if (fetched) savePath.run(path, buf.length, m.chat_jid, m.id);
+        const { text: t } = await transcribe(buf, { mime: m.media_mime, kind: m.kind });
+        saveTranscript.run(t, m.chat_jid, m.id);
+        out.push(`${head}\n${t}`);
+      } catch (e) {
+        out.push(`${head}\n(failed: ${e.message})`);
+        if (/rate limit|API key/.test(e.message)) break;   // the rest would fail the same way
+      }
+    }
+    return text(out.join('\n\n'));
   },
 
   wa_reactions({ chat, emoji, limit = 40 }) {
@@ -322,7 +406,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const fn = handlers[req.params.name];
   if (!fn) return { content: [{ type: 'text', text: `Unknown tool ${req.params.name}` }], isError: true };
   try {
-    return fn(req.params.arguments || {});
+    return await fn(req.params.arguments || {});
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
   }

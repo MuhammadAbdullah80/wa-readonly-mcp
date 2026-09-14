@@ -1,14 +1,14 @@
 {
   "name": "wa-readonly-mcp",
   "version": "1.0.0",
-  "description": "Read-only WhatsApp bridge and MCP server for Claude Code. Pure Node, no native builds, self-healing, never sends.",
+  "description": "Read-only WhatsApp bridge and MCP server for Claude Code. Voice-note transcription with Gemini. Pure Node, no native builds, self-healing, never sends.",
   "license": "MIT",
   "author": "Muhammad Abdullah",
   "repository": {
     "type": "git",
     "url": "https://github.com/MuhammadAbdullah80/wa-readonly-mcp"
   },
-  "keywords": ["whatsapp", "mcp", "claude", "claude-code", "baileys", "read-only", "model-context-protocol"],
+  "keywords": ["whatsapp", "mcp", "claude", "claude-code", "baileys", "read-only", "model-context-protocol", "gemini", "transcription"],
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -18,7 +18,7 @@
     "start": "node bridge.js",
     "register": "node register.js",
     "unregister": "node register.js --remove",
-    "check": "node --check bridge.js && node --check server.js && node --check db.js && node --check register.js"
+    "check": "node --check bridge.js && node --check server.js && node --check db.js && node --check transcribe.js && node --check register.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
